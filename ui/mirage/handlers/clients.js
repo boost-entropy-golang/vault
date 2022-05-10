@@ -1,5 +1,15 @@
-import { addDays, formatISO, formatRFC3339, isAfter, isBefore, sub, isSameMonth, startOfMonth } from 'date-fns';
+import {
+  addDays,
+  formatISO,
+  formatRFC3339,
+  isAfter,
+  isBefore,
+  sub,
+  isSameMonth,
+  startOfMonth,
+} from 'date-fns';
 import { parseAPITimestamp } from 'core/utils/date-formatters';
+
 const MOCK_MONTHLY_DATA = [
   {
     timestamp: '2021-05-01T00:00:00Z',
@@ -7,7 +17,7 @@ const MOCK_MONTHLY_DATA = [
       distinct_entities: 0,
       entity_clients: 25,
       non_entity_tokens: 0,
-      non_entity_clients: 20,
+      non_entity_clients: 25,
       clients: 50,
     },
     namespaces: [
@@ -840,7 +850,7 @@ export default function (server) {
           ],
           license_id: '060d7820-fa59-f95c-832b-395db0aeb9ba',
           performance_standby_count: 9999,
-          start_time: formatRFC3339(startTime)
+          start_time: formatRFC3339(startTime),
         },
         persisted_autoload: {
           expiration_time: formatRFC3339(addDays(startTime, 365)),
@@ -863,7 +873,7 @@ export default function (server) {
           ],
           license_id: '060d7820-fa59-f95c-832b-395db0aeb9ba',
           performance_standby_count: 9999,
-          start_time: formatRFC3339(startTime)
+          start_time: formatRFC3339(startTime),
         },
       },
     };
@@ -974,6 +984,26 @@ export default function (server) {
                   non_entity_tokens: 5023,
                   non_entity_clients: 5023,
                   clients: 11212,
+                },
+              },
+              {
+                mount_path: 'auth/up2/',
+                counts: {
+                  distinct_entities: 0,
+                  entity_clients: 50,
+                  non_entity_tokens: 0,
+                  non_entity_clients: 23,
+                  clients: 73,
+                },
+              },
+              {
+                mount_path: 'auth/up1/',
+                counts: {
+                  distinct_entities: 0,
+                  entity_clients: 25,
+                  non_entity_tokens: 0,
+                  non_entity_clients: 15,
+                  clients: 40,
                 },
               },
             ],
