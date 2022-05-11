@@ -1,10 +1,10 @@
 package pki
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/x509"
-	"encoding/pem"
 	"fmt"
 	"strings"
 
@@ -24,6 +24,9 @@ const (
 	legacyMigrationBundleLogKey = "config/legacyMigrationBundleLog"
 	legacyCertBundlePath        = "config/ca_bundle"
 	legacyCRLPath               = "crl"
+
+	// Used as a quick sanity check for a reference id lookups...
+	uuidLength = 36
 )
 
 type keyID string
@@ -349,15 +352,12 @@ func importKey(mkc managedKeyContext, s logical.Storage, keyValue string, keyNam
 }
 
 func (i issuerEntry) GetCertificate() (*x509.Certificate, error) {
-	block, extra := pem.Decode([]byte(i.Certificate))
-	if block == nil {
-		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to parse certificate from issuer: invalid PEM: %v", i.ID)}
-	}
-	if len(strings.TrimSpace(string(extra))) > 0 {
-		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to parse certificate for issuer (%v): trailing PEM data: %v", i.ID, string(extra))}
+	cert, err := parseCertificateFromBytes([]byte(i.Certificate))
+	if err != nil {
+		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to parse certificate from issuer: %s: %v", err.Error(), i.ID)}
 	}
 
-	return x509.ParseCertificate(block.Bytes)
+	return cert, nil
 }
 
 func (i issuerEntry) EnsureUsage(usage issuerUsage) error {
@@ -412,19 +412,22 @@ func resolveKeyReference(ctx context.Context, s logical.Storage, reference strin
 		return config.DefaultKeyId, nil
 	}
 
-	keys, err := listKeys(ctx, s)
-	if err != nil {
-		return keyID("list-error"), err
-	}
-
-	// Cheaper to list keys and check if an id is a match...
-	for _, keyId := range keys {
-		if keyId == keyID(reference) {
-			return keyId, nil
+	// Lookup by a direct get first to see if our reference is an ID, this is quick and cached.
+	if len(reference) == uuidLength {
+		entry, err := s.Get(ctx, keyPrefix+reference)
+		if err != nil {
+			return keyID("key-read"), err
+		}
+		if entry != nil {
+			return keyID(reference), nil
 		}
 	}
 
 	// ... than to pull all keys from storage.
+	keys, err := listKeys(ctx, s)
+	if err != nil {
+		return keyID("list-error"), err
+	}
 	for _, keyId := range keys {
 		key, err := fetchKeyById(ctx, s, keyId)
 		if err != nil {
@@ -440,6 +443,7 @@ func resolveKeyReference(ctx context.Context, s logical.Storage, reference strin
 	return KeyRefNotFound, errutil.UserError{Err: fmt.Sprintf("unable to find PKI key for reference: %v", reference)}
 }
 
+// fetchIssuerById returns an issuerEntry based on issuerId, if none found an error is returned.
 func fetchIssuerById(ctx context.Context, s logical.Storage, issuerId issuerID) (*issuerEntry, error) {
 	if len(issuerId) == 0 {
 		return nil, errutil.InternalError{Err: fmt.Sprintf("unable to fetch pki issuer: empty issuer identifier")}
@@ -513,19 +517,23 @@ func importIssuer(ctx managedKeyContext, s logical.Storage, certValue string, is
 	// Discussed further in #11960 and RFC 7468.
 	certValue = strings.TrimSpace(certValue) + "\n"
 
-	// Before we can import a known issuer, we first need to know if the issuer
-	// exists in storage already. This means iterating through all known
-	// issuers and comparing their private value against this value.
-	knownIssuers, err := listIssuers(ctx.ctx, s)
+	// Extracting the certificate is necessary for two reasons: first, it lets
+	// us fetch the serial number; second, for the public key comparison with
+	// known keys.
+	issuerCert, err := parseCertificateFromBytes([]byte(certValue))
 	if err != nil {
 		return nil, false, err
 	}
 
-	// Before we return below, we need to iterate over _all_ keys and see if
-	// one of them a public key matching this certificate, and if so, update our
-	// link accordingly. We fetch the list of keys up front, even may not need
-	// it, to give ourselves a better chance of succeeding below.
-	knownKeys, err := listKeys(ctx.ctx, s)
+	// Ensure this certificate is a usable as a CA certificate.
+	if !issuerCert.BasicConstraintsValid || !issuerCert.IsCA {
+		return nil, false, errutil.UserError{Err: "Refusing to import non-CA certificate"}
+	}
+
+	// Before we can import a known issuer, we first need to know if the issuer
+	// exists in storage already. This means iterating through all known
+	// issuers and comparing their private value against this value.
+	knownIssuers, err := listIssuers(ctx.ctx, s)
 	if err != nil {
 		return nil, false, err
 	}
@@ -535,8 +543,11 @@ func importIssuer(ctx managedKeyContext, s logical.Storage, certValue string, is
 		if err != nil {
 			return nil, false, err
 		}
-
-		if existingIssuer.Certificate == certValue {
+		existingIssuerCert, err := existingIssuer.GetCertificate()
+		if err != nil {
+			return nil, false, err
+		}
+		if areCertificatesEqual(existingIssuerCert, issuerCert) {
 			// Here, we don't need to stitch together the key entries,
 			// because the last run should've done that for us (or, when
 			// importing a key).
@@ -559,20 +570,16 @@ func importIssuer(ctx managedKeyContext, s logical.Storage, certValue string, is
 		return nil, false, fmt.Errorf("bad issuer: potentially multiple PEM blobs in one certificate storage entry:\n%v", result.Certificate)
 	}
 
-	// Extracting the certificate is necessary for two reasons: first, it lets
-	// us fetch the serial number; second, for the public key comparison with
-	// known keys.
-	issuerCert, err := result.GetCertificate()
+	result.SerialNumber = strings.TrimSpace(certutil.GetHexFormatted(issuerCert.SerialNumber.Bytes(), ":"))
+
+	// Before we return below, we need to iterate over _all_ keys and see if
+	// one of them a public key matching this certificate, and if so, update our
+	// link accordingly. We fetch the list of keys up front, even may not need
+	// it, to give ourselves a better chance of succeeding below.
+	knownKeys, err := listKeys(ctx.ctx, s)
 	if err != nil {
 		return nil, false, err
 	}
-
-	// Ensure this certificate is a usable as a CA certificate.
-	if !issuerCert.BasicConstraintsValid || !issuerCert.IsCA {
-		return nil, false, errutil.UserError{Err: "Refusing to import non-CA certificate"}
-	}
-
-	result.SerialNumber = strings.TrimSpace(certutil.GetHexFormatted(issuerCert.SerialNumber.Bytes(), ":"))
 
 	// Now, for each key, try and compute the issuer<->key link. We delay
 	// writing issuer to storage as we won't need to update the key, only
@@ -618,6 +625,10 @@ func importIssuer(ctx managedKeyContext, s logical.Storage, certValue string, is
 
 	// All done; return our new key reference.
 	return &result, false, nil
+}
+
+func areCertificatesEqual(cert1 *x509.Certificate, cert2 *x509.Certificate) bool {
+	return bytes.Compare(cert1.Raw, cert2.Raw) == 0
 }
 
 func setLocalCRLConfig(ctx context.Context, s logical.Storage, mapping *localCRLConfigEntry) error {
@@ -703,6 +714,10 @@ func getIssuersConfig(ctx context.Context, s logical.Storage) (*issuerConfigEntr
 	return issuerConfig, nil
 }
 
+// Lookup within storage the value of reference, assuming the string is a reference to an issuer entry,
+// returning the converted issuerID or an error if not found. This method will not properly resolve the
+// special legacyBundleShimID value as we do not want to confuse our special value and a user-provided name of the
+// same value.
 func resolveIssuerReference(ctx context.Context, s logical.Storage, reference string) (issuerID, error) {
 	if reference == defaultRef {
 		// Handle fetching the default issuer.
@@ -717,19 +732,23 @@ func resolveIssuerReference(ctx context.Context, s logical.Storage, reference st
 		return config.DefaultIssuerId, nil
 	}
 
+	// Lookup by a direct get first to see if our reference is an ID, this is quick and cached.
+	if len(reference) == uuidLength {
+		entry, err := s.Get(ctx, issuerPrefix+reference)
+		if err != nil {
+			return issuerID("issuer-read"), err
+		}
+		if entry != nil {
+			return issuerID(reference), nil
+		}
+	}
+
+	// ... than to pull all issuers from storage.
 	issuers, err := listIssuers(ctx, s)
 	if err != nil {
 		return issuerID("list-error"), err
 	}
 
-	// Cheaper to list issuers and check if an id is a match...
-	for _, issuerId := range issuers {
-		if issuerId == issuerID(reference) {
-			return issuerId, nil
-		}
-	}
-
-	// ... than to pull all issuers from storage.
 	for _, issuerId := range issuers {
 		issuer, err := fetchIssuerById(ctx, s, issuerId)
 		if err != nil {
@@ -747,7 +766,7 @@ func resolveIssuerReference(ctx context.Context, s logical.Storage, reference st
 
 func resolveIssuerCRLPath(ctx context.Context, b *backend, s logical.Storage, reference string) (string, error) {
 	if b.useLegacyBundleCaStorage() {
-		return "crl", nil
+		return legacyCRLPath, nil
 	}
 
 	issuer, err := resolveIssuerReference(ctx, s, reference)
@@ -768,8 +787,23 @@ func resolveIssuerCRLPath(ctx context.Context, b *backend, s logical.Storage, re
 }
 
 // Builds a certutil.CertBundle from the specified issuer identifier,
-// optionally loading the key or not.
+// optionally loading the key or not. This method supports loading legacy
+// bundles using the legacyBundleShimID issuerId, and if no entry is found will return an error.
 func fetchCertBundleByIssuerId(ctx context.Context, s logical.Storage, id issuerID, loadKey bool) (*issuerEntry, *certutil.CertBundle, error) {
+	if id == legacyBundleShimID {
+		// We have not completed the migration, or started a request in legacy mode, so
+		// attempt to load the bundle from the legacy location
+		issuer, bundle, err := getLegacyCertBundle(ctx, s)
+		if err != nil {
+			return nil, nil, err
+		}
+		if issuer == nil || bundle == nil {
+			return nil, nil, errutil.UserError{Err: "no legacy cert bundle exists"}
+		}
+
+		return issuer, bundle, err
+	}
+
 	issuer, err := fetchIssuerById(ctx, s, id)
 	if err != nil {
 		return nil, nil, err

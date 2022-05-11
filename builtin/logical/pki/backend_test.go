@@ -9,16 +9,12 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"hash"
-	"io/ioutil"
 	"math"
 	"math/big"
 	mathrand "math/rand"
@@ -711,30 +707,7 @@ func generateCSR(t *testing.T, csrTemplate *x509.CertificateRequest, keyType str
 }
 
 func generateCSRSteps(t *testing.T, caCert, caKey string, intdata, reqdata map[string]interface{}) []logicaltest.TestStep {
-	csrTemplate := x509.CertificateRequest{
-		Subject: pkix.Name{
-			Country:      []string{"MyCountry"},
-			PostalCode:   []string{"MyPostalCode"},
-			SerialNumber: "MySerialNumber",
-			CommonName:   "my@example.com",
-		},
-		DNSNames: []string{
-			"name1.example.com",
-			"name2.example.com",
-			"name3.example.com",
-		},
-		EmailAddresses: []string{
-			"name1@example.com",
-			"name2@example.com",
-			"name3@example.com",
-		},
-		IPAddresses: []net.IP{
-			net.ParseIP("::ff:1:2:3:4"),
-			net.ParseIP("::ff:5:6:7:8"),
-		},
-	}
-
-	_, _, csrPem := generateCSR(t, &csrTemplate, "rsa", 2048)
+	csrTemplate, csrPem := generateTestCsr(t, certutil.RSAPrivateKey, 2048)
 
 	ret := []logicaltest.TestStep{
 		{
@@ -822,6 +795,34 @@ func generateCSRSteps(t *testing.T, caCert, caKey string, intdata, reqdata map[s
 		},
 	}
 	return ret
+}
+
+func generateTestCsr(t *testing.T, keyType certutil.PrivateKeyType, keyBits int) (x509.CertificateRequest, string) {
+	csrTemplate := x509.CertificateRequest{
+		Subject: pkix.Name{
+			Country:      []string{"MyCountry"},
+			PostalCode:   []string{"MyPostalCode"},
+			SerialNumber: "MySerialNumber",
+			CommonName:   "my@example.com",
+		},
+		DNSNames: []string{
+			"name1.example.com",
+			"name2.example.com",
+			"name3.example.com",
+		},
+		EmailAddresses: []string{
+			"name1@example.com",
+			"name2@example.com",
+			"name3@example.com",
+		},
+		IPAddresses: []net.IP{
+			net.ParseIP("::ff:1:2:3:4"),
+			net.ParseIP("::ff:5:6:7:8"),
+		},
+	}
+
+	_, _, csrPem := generateCSR(t, &csrTemplate, string(keyType), keyBits)
+	return csrTemplate, csrPem
 }
 
 // Generates steps to test out various role permutations
@@ -2780,23 +2781,6 @@ func TestBackend_SignSelfIssued_DifferentTypes(t *testing.T) {
 	}
 }
 
-func getSelfSigned(t *testing.T, subject, issuer *x509.Certificate, key *rsa.PrivateKey) (string, *x509.Certificate) {
-	t.Helper()
-	selfSigned, err := x509.CreateCertificate(rand.Reader, subject, issuer, key.Public(), key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cert, err := x509.ParseCertificate(selfSigned)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pemSS := strings.TrimSpace(string(pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: selfSigned,
-	})))
-	return pemSS, cert
-}
-
 // This is a really tricky test because the Go stdlib asn1 package is incapable
 // of doing the right thing with custom OID SANs (see comments in the package,
 // it's readily admitted that it's too magic) but that means that any
@@ -4028,70 +4012,6 @@ func TestBackend_RevokePlusTidy_Intermediate(t *testing.T) {
 	}
 }
 
-func getParsedCrl(t *testing.T, client *api.Client, mountPoint string) *pkix.CertificateList {
-	path := fmt.Sprintf("/v1/%s/crl", mountPoint)
-	return getParsedCrlAtPath(t, client, path)
-}
-
-func getParsedCrlForIssuer(t *testing.T, client *api.Client, mountPoint string, issuer string) *pkix.CertificateList {
-	path := fmt.Sprintf("/v1/%v/issuer/%v/crl/der", mountPoint, issuer)
-	crl := getParsedCrlAtPath(t, client, path)
-
-	// Now fetch the issuer as well and verify the certificate
-	path = fmt.Sprintf("/v1/%v/issuer/%v/der", mountPoint, issuer)
-	req := client.NewRequest("GET", path)
-	resp, err := client.RawRequest(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	certBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if len(certBytes) == 0 {
-		t.Fatalf("expected certificate in response body")
-	}
-
-	cert, err := x509.ParseCertificate(certBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cert == nil {
-		t.Fatalf("expected parsed certificate")
-	}
-
-	if err := cert.CheckCRLSignature(crl); err != nil {
-		t.Fatalf("expected valid signature on CRL for issuer %v: %v", issuer, crl)
-	}
-
-	return crl
-}
-
-func getParsedCrlAtPath(t *testing.T, client *api.Client, path string) *pkix.CertificateList {
-	req := client.NewRequest("GET", path)
-	resp, err := client.RawRequest(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-
-	crlBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("err: %s", err)
-	}
-	if len(crlBytes) == 0 {
-		t.Fatalf("expected CRL in response body")
-	}
-
-	crl, err := x509.ParseDERCRL(crlBytes)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return crl
-}
-
 func TestBackend_Root_FullCAChain(t *testing.T) {
 	testCases := []struct {
 		testName string
@@ -4158,9 +4078,23 @@ func runFullCAChainTest(t *testing.T, keyType string) {
 	}
 
 	fullChain := resp.Data["ca_chain"].(string)
-	if strings.Count(fullChain, rootCert) != 1 {
-		t.Fatalf("expected full chain to contain root certificate; got %v occurrences", strings.Count(fullChain, rootCert))
-	}
+	requireCertInCaChainString(t, fullChain, rootCert, "expected root cert within root cert/ca_chain")
+
+	// Make sure when we issue a leaf certificate we get the full chain back.
+	resp, err = client.Logical().Write("pki-root/roles/example", map[string]interface{}{
+		"allowed_domains":  "example.com",
+		"allow_subdomains": "true",
+		"max_ttl":          "1h",
+	})
+	require.NoError(t, err, "error setting up pki root role: %v", err)
+
+	resp, err = client.Logical().Write("pki-root/issue/example", map[string]interface{}{
+		"common_name": "test.example.com",
+		"ttl":         "5m",
+	})
+	require.NoError(t, err, "error issuing certificate from pki root: %v", err)
+	fullChainArray := resp.Data["ca_chain"].([]interface{})
+	requireCertInCaChainArray(t, fullChainArray, rootCert, "expected root cert within root issuance pki-root/issue/example")
 
 	// Now generate an intermediate at /pki-intermediate, signed by the root.
 	err = client.Sys().Mount("pki-intermediate", &api.MountInput{
@@ -4226,12 +4160,25 @@ func runFullCAChainTest(t *testing.T, keyType string) {
 	require.Equal(t, 0, len(crl.TBSCertList.RevokedCertificates))
 
 	fullChain = resp.Data["ca_chain"].(string)
-	if strings.Count(fullChain, intermediateCert) != 1 {
-		t.Fatalf("expected full chain to contain intermediate certificate; got %v occurrences", strings.Count(fullChain, intermediateCert))
-	}
-	if strings.Count(fullChain, rootCert) != 1 {
-		t.Fatalf("expected full chain to contain root certificate; got %v occurrences", strings.Count(fullChain, rootCert))
-	}
+	requireCertInCaChainString(t, fullChain, intermediateCert, "expected full chain to contain intermediate certificate from pki-intermediate/cert/ca_chain")
+	requireCertInCaChainString(t, fullChain, rootCert, "expected full chain to contain root certificate from pki-intermediate/cert/ca_chain")
+
+	// Make sure when we issue a leaf certificate we get the full chain back.
+	resp, err = client.Logical().Write("pki-intermediate/roles/example", map[string]interface{}{
+		"allowed_domains":  "example.com",
+		"allow_subdomains": "true",
+		"max_ttl":          "1h",
+	})
+	require.NoError(t, err, "error setting up pki intermediate role: %v", err)
+
+	resp, err = client.Logical().Write("pki-intermediate/issue/example", map[string]interface{}{
+		"common_name": "test.example.com",
+		"ttl":         "5m",
+	})
+	require.NoError(t, err, "error issuing certificate from pki intermediate: %v", err)
+	fullChainArray = resp.Data["ca_chain"].([]interface{})
+	requireCertInCaChainArray(t, fullChainArray, intermediateCert, "expected full chain to contain intermediate certificate from pki-intermediate/issue/example")
+	requireCertInCaChainArray(t, fullChainArray, rootCert, "expected full chain to contain root certificate from pki-intermediate/issue/example")
 
 	// Finally, import this signing cert chain into a new mount to ensure
 	// "external" CAs behave as expected.
@@ -4289,6 +4236,23 @@ func runFullCAChainTest(t *testing.T, keyType string) {
 
 	// Verify that the certificates are signed by the intermediary CA key...
 	requireSignedBy(t, issuedCrt, intermediaryCaCert.PublicKey)
+}
+
+func requireCertInCaChainArray(t *testing.T, chain []interface{}, cert string, msgAndArgs ...interface{}) {
+	var fullChain string
+	for _, caCert := range chain {
+		fullChain = fullChain + "\n" + caCert.(string)
+	}
+
+	requireCertInCaChainString(t, fullChain, cert, msgAndArgs)
+}
+
+func requireCertInCaChainString(t *testing.T, chain string, cert string, msgAndArgs ...interface{}) {
+	count := strings.Count(chain, cert)
+	if count != 1 {
+		failMsg := fmt.Sprintf("Found %d occurrances of the cert in the provided chain", count)
+		require.FailNow(t, failMsg, msgAndArgs...)
+	}
 }
 
 type MultiBool int
@@ -5074,90 +5038,3 @@ var (
 	edCAKey   string
 	edCACert  string
 )
-
-func mountPKIEndpoint(t *testing.T, client *api.Client, path string) {
-	var err error
-	err = client.Sys().Mount(path, &api.MountInput{
-		Type: "pki",
-		Config: api.MountConfigInput{
-			DefaultLeaseTTL: "16h",
-			MaxLeaseTTL:     "32h",
-		},
-	})
-	require.NoError(t, err, "failed mounting pki endpoint")
-}
-
-func requireSignedBy(t *testing.T, cert *x509.Certificate, key crypto.PublicKey) {
-	switch key.(type) {
-	case *rsa.PublicKey:
-		requireRSASignedBy(t, cert, key.(*rsa.PublicKey))
-	case *ecdsa.PublicKey:
-		requireECDSASignedBy(t, cert, key.(*ecdsa.PublicKey))
-	case ed25519.PublicKey:
-		requireED25519SignedBy(t, cert, key.(ed25519.PublicKey))
-	default:
-		require.Fail(t, "unknown public key type %#v", key)
-	}
-}
-
-func requireRSASignedBy(t *testing.T, cert *x509.Certificate, key *rsa.PublicKey) {
-	require.Contains(t, []x509.SignatureAlgorithm{x509.SHA256WithRSA, x509.SHA512WithRSA},
-		cert.SignatureAlgorithm, "only sha256 signatures supported")
-
-	var hasher hash.Hash
-	var hashAlgo crypto.Hash
-
-	switch cert.SignatureAlgorithm {
-	case x509.SHA256WithRSA:
-		hasher = sha256.New()
-		hashAlgo = crypto.SHA256
-	case x509.SHA512WithRSA:
-		hasher = sha512.New()
-		hashAlgo = crypto.SHA512
-	}
-
-	hasher.Write(cert.RawTBSCertificate)
-	hashData := hasher.Sum(nil)
-
-	err := rsa.VerifyPKCS1v15(key, hashAlgo, hashData, cert.Signature)
-	require.NoError(t, err, "the certificate was not signed by the expected public rsa key.")
-}
-
-func requireECDSASignedBy(t *testing.T, cert *x509.Certificate, key *ecdsa.PublicKey) {
-	require.Contains(t, []x509.SignatureAlgorithm{x509.ECDSAWithSHA256, x509.ECDSAWithSHA512},
-		cert.SignatureAlgorithm, "only ecdsa signatures supported")
-
-	var hasher hash.Hash
-	switch cert.SignatureAlgorithm {
-	case x509.ECDSAWithSHA256:
-		hasher = sha256.New()
-	case x509.ECDSAWithSHA512:
-		hasher = sha512.New()
-	}
-
-	hasher.Write(cert.RawTBSCertificate)
-	hashData := hasher.Sum(nil)
-
-	verify := ecdsa.VerifyASN1(key, hashData, cert.Signature)
-	require.True(t, verify, "the certificate was not signed by the expected public ecdsa key.")
-}
-
-func requireED25519SignedBy(t *testing.T, cert *x509.Certificate, key ed25519.PublicKey) {
-	require.Equal(t, x509.PureEd25519, cert.SignatureAlgorithm)
-	ed25519.Verify(key, cert.RawTBSCertificate, cert.Signature)
-}
-
-func parseCert(t *testing.T, pemCert string) *x509.Certificate {
-	block, _ := pem.Decode([]byte(pemCert))
-	require.NotNil(t, block, "failed to decode PEM block")
-
-	cert, err := x509.ParseCertificate(block.Bytes)
-	require.NoError(t, err)
-	return cert
-}
-
-func requireMatchingPublicKeys(t *testing.T, cert *x509.Certificate, key crypto.PublicKey) {
-	certPubKey := cert.PublicKey
-	require.True(t, reflect.DeepEqual(certPubKey, key),
-		"public keys mismatched: got: %v, expected: %v", certPubKey, key)
-}

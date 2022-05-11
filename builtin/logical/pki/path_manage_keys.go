@@ -19,14 +19,22 @@ func pathGenerateKey(b *backend) *framework.Path {
 				Description: "Optional name to be used for this key",
 			},
 			keyTypeParam: {
-				Type:        framework.TypeString,
-				Default:     "rsa",
-				Description: `Type of the secret key to generate`,
+				Type:    framework.TypeString,
+				Default: "rsa",
+				Description: `The type of key to use; defaults to RSA. "rsa"
+"ec" and "ed25519" are the only valid values.`,
+				AllowedValues: []interface{}{"rsa", "ec", "ed25519"},
+				DisplayAttrs: &framework.DisplayAttributes{
+					Value: "rsa",
+				},
 			},
 			keyBitsParam: {
-				Type:        framework.TypeInt,
-				Default:     2048,
-				Description: `Type of the secret key to generate`,
+				Type:    framework.TypeInt,
+				Default: 0,
+				Description: `The number of bits to use. Allowed values are
+0 (universal default); with rsa key_type: 2048 (default), 3072, or
+4096; with ec key_type: 224, 256 (default), 384, or 521; ignored with
+ed25519.`,
 			},
 			"managed_key_name": {
 				Type: framework.TypeString,
@@ -66,6 +74,10 @@ func (b *backend) pathGenerateKeyHandler(ctx context.Context, req *logical.Reque
 	b.issuersLock.Lock()
 	defer b.issuersLock.Unlock()
 
+	if b.useLegacyBundleCaStorage() {
+		return logical.ErrorResponse("Can not generate keys until migration has completed"), nil
+	}
+
 	keyName, err := getKeyName(ctx, req.Storage, data)
 	if err != nil { // Fail Immediately if Key Name is in Use, etc...
 		return nil, err
@@ -82,6 +94,11 @@ func (b *backend) pathGenerateKeyHandler(ctx context.Context, req *logical.Reque
 	case strings.HasSuffix(req.Path, "/internal"):
 		keyType := data.Get(keyTypeParam).(string)
 		keyBits := data.Get(keyBitsParam).(int)
+
+		keyBits, _, err := certutil.ValidateDefaultOrValueKeyTypeSignatureLength(keyType, keyBits, 0)
+		if err != nil {
+			return logical.ErrorResponse("Validation for key_type, key_bits failed: %s", err.Error()), nil
+		}
 
 		// Internal key generation, stored in storage
 		keyBundle, err = certutil.CreateKeyBundle(keyType, keyBits, b.GetRandomReader())
@@ -142,7 +159,7 @@ func pathImportKey(b *backend) *framework.Path {
 		},
 
 		Operations: map[logical.Operation]framework.OperationHandler{
-			logical.CreateOperation: &framework.PathOperation{
+			logical.UpdateOperation: &framework.PathOperation{
 				Callback:                    b.pathImportKeyHandler,
 				ForwardPerformanceStandby:   true,
 				ForwardPerformanceSecondary: true,
@@ -165,6 +182,10 @@ func (b *backend) pathImportKeyHandler(ctx context.Context, req *logical.Request
 	// got a consistent view.
 	b.issuersLock.Lock()
 	defer b.issuersLock.Unlock()
+
+	if b.useLegacyBundleCaStorage() {
+		return logical.ErrorResponse("Cannot import keys until migration has completed"), nil
+	}
 
 	keyValueInterface, isOk := data.GetOk("pem_bundle")
 	if !isOk {

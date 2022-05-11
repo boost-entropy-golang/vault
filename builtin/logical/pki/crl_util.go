@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -62,7 +61,9 @@ func (cb *crlBuilder) rebuild(ctx context.Context, b *backend, request *logical.
 
 // requestRebuildIfActiveNode will schedule a rebuild of the CRL from the next read or write api call assuming we are the active node of a cluster
 func (cb *crlBuilder) requestRebuildIfActiveNode(b *backend) {
-	// Only schedule us on active nodes, ignoring secondary nodes, the active can/should rebuild the CRL.
+	// Only schedule us on active nodes, as the active node is the only node that can rebuild/write the CRL.
+	// Note 1: The CRL is cluster specific, so this does need to run on the active node of a performance secondary cluster.
+	// Note 2: This is called by the storage invalidation function, so it should not block.
 	if b.System().ReplicationState().HasState(consts.ReplicationPerformanceStandby) ||
 		b.System().ReplicationState().HasState(consts.ReplicationDRSecondary) {
 		b.Logger().Debug("Ignoring request to schedule a CRL rebuild, not on active node.")
@@ -70,19 +71,24 @@ func (cb *crlBuilder) requestRebuildIfActiveNode(b *backend) {
 	}
 
 	b.Logger().Info("Scheduling PKI CRL rebuild.")
-	cb.m.Lock()
-	defer cb.m.Unlock()
-	atomic.StoreUint32(&cb.forceRebuild, 1)
+	// Set the flag to 1, we don't care if we aren't the ones that actually swap it to 1.
+	atomic.CompareAndSwapUint32(&cb.forceRebuild, 0, 1)
 }
 
 func (cb *crlBuilder) _doRebuild(ctx context.Context, b *backend, request *logical.Request, forceNew bool, ignoreForceFlag bool) error {
 	cb.m.Lock()
 	defer cb.m.Unlock()
-	if cb.forceRebuild == 1 || ignoreForceFlag {
-		defer atomic.StoreUint32(&cb.forceRebuild, 0)
+	// Re-read the lock in case someone beat us to the punch between the previous load op.
+	forceBuildFlag := atomic.LoadUint32(&cb.forceRebuild)
+	if forceBuildFlag == 1 || ignoreForceFlag {
+		// Reset our original flag back to 0 before we start the rebuilding. This may lead to another round of
+		// CRL building, but we want to avoid the race condition caused by clearing the flag after we completed (An
+		// update/revocation occurred attempting to set the flag, after we listed the certs but before we wrote
+		// the CRL, so we missed the update and cleared the flag.)
+		atomic.CompareAndSwapUint32(&cb.forceRebuild, 1, 0)
 
 		// if forceRebuild was requested, that should force a complete rebuild even if requested not too by forceNew
-		myForceNew := cb.forceRebuild == 1 || forceNew
+		myForceNew := forceBuildFlag == 1 || forceNew
 		return buildCRLs(ctx, b, request, myForceNew)
 	}
 
@@ -100,22 +106,43 @@ func revokeCert(ctx context.Context, b *backend, req *logical.Request, serial st
 		return nil, nil
 	}
 
-	signingBundle, caErr := fetchCAInfo(ctx, b, req, defaultRef, ReadOnlyUsage)
-	if caErr != nil {
-		switch caErr.(type) {
-		case errutil.UserError:
-			return logical.ErrorResponse(fmt.Sprintf("could not fetch the CA certificate: %s", caErr)), nil
-		default:
-			return nil, fmt.Errorf("error fetching CA certificate: %s", caErr)
+	// Validate that no issuers match the serial number to be revoked. We need
+	// to gracefully degrade to the legacy cert bundle when it is required, as
+	// secondary PR clusters might not have been upgraded, but still need to
+	// handle revoking certs.
+	var err error
+	var issuers []issuerID
+
+	if !b.useLegacyBundleCaStorage() {
+		issuers, err = listIssuers(ctx, req.Storage)
+		if err != nil {
+			return logical.ErrorResponse(fmt.Sprintf("could not fetch issuers list: %v", err)), nil
 		}
+	} else {
+		// Hack: this isn't a real issuerID, but it works for fetchCAInfo
+		// since it resolves the reference.
+		issuers = []issuerID{legacyBundleShimID}
 	}
 
-	if signingBundle == nil {
-		return nil, errors.New("CA info not found")
-	}
-	colonSerial := strings.Replace(strings.ToLower(serial), "-", ":", -1)
-	if colonSerial == certutil.GetHexFormatted(signingBundle.Certificate.SerialNumber.Bytes(), ":") {
-		return logical.ErrorResponse("adding CA to CRL is not allowed"), nil
+	for _, issuer := range issuers {
+		signingBundle, caErr := fetchCAInfoByIssuerId(ctx, b, req, issuer, ReadOnlyUsage)
+		if caErr != nil {
+			switch caErr.(type) {
+			case errutil.UserError:
+				return logical.ErrorResponse(fmt.Sprintf("could not fetch the CA certificate for issuer id %v: %s", issuer, caErr)), nil
+			default:
+				return nil, fmt.Errorf("error fetching CA certificate for issuer id %v: %s", issuer, caErr)
+			}
+		}
+
+		if signingBundle == nil {
+			return nil, fmt.Errorf("faulty reference: %v - CA info not found", issuer)
+		}
+
+		colonSerial := strings.Replace(strings.ToLower(serial), "-", ":", -1)
+		if colonSerial == certutil.GetHexFormatted(signingBundle.Certificate.SerialNumber.Bytes(), ":") {
+			return logical.ErrorResponse(fmt.Sprintf("adding issuer (id: %v) to its own CRL is not allowed", issuer)), nil
+		}
 	}
 
 	alreadyRevoked := false
@@ -171,7 +198,9 @@ func revokeCert(ctx context.Context, b *backend, req *logical.Request, serial st
 		// Add a little wiggle room because leases are stored with a second
 		// granularity
 		if cert.NotAfter.Before(time.Now().Add(2 * time.Second)) {
-			return nil, nil
+			response := &logical.Response{}
+			response.AddWarning(fmt.Sprintf("certificate with serial %s already expired; refusing to add to CRL", serial))
+			return response, nil
 		}
 
 		// Compatibility: Don't revoke CAs if they had leases. New CAs going
@@ -237,13 +266,27 @@ func buildCRLs(ctx context.Context, b *backend, req *logical.Request, forceNew b
 	// map with the revoked cert instance. If no such issuer is found, we'll
 	// place it in the default issuer's CRL.
 	//
-	// By not updating storage, we allow issuers to come and go (either by
-	// direct deletion or by having their keys delete, preventing CRLs from
-	// being signed) -- and when they return, we'll correctly place certs
+	// By not relying on the _cert_'s storage, we allow issuers to come and
+	// go (either by direct deletion, having their keys deleted, or by usage
+	// restrictions) -- and when they return, we'll correctly place certs
 	// on their CRLs.
-	issuers, err := listIssuers(ctx, req.Storage)
-	if err != nil {
-		return fmt.Errorf("error building CRL: while listing issuers: %v", err)
+
+	// See the message in revokedCert about rebuilding CRLs: we need to
+	// gracefully handle revoking entries with the legacy cert bundle.
+	var err error
+	var issuers []issuerID
+	var wasLegacy bool
+	if !b.useLegacyBundleCaStorage() {
+		issuers, err = listIssuers(ctx, req.Storage)
+		if err != nil {
+			return fmt.Errorf("error building CRL: while listing issuers: %v", err)
+		}
+	} else {
+		// Here, we hard-code the legacy issuer entry instead of using the
+		// default ref. This is because we need to hack some of the logic
+		// below for revocation to handle the legacy bundle.
+		issuers = []issuerID{legacyBundleShimID}
+		wasLegacy = true
 	}
 
 	config, err := getIssuersConfig(ctx, req.Storage)
@@ -261,7 +304,9 @@ func buildCRLs(ctx context.Context, b *backend, req *logical.Request, forceNew b
 	// key/subject and choose any representative issuer for that combination.
 	keySubjectIssuersMap := make(map[keyID]map[string][]issuerID)
 	for _, issuer := range issuers {
-		thisEntry, err := fetchIssuerById(ctx, req.Storage, issuer)
+		// We don't strictly need this call, but by requesting the bundle, the
+		// legacy path is automatically ignored.
+		thisEntry, _, err := fetchCertBundleByIssuerId(ctx, req.Storage, issuer, false)
 		if err != nil {
 			return fmt.Errorf("error building CRLs: unable to fetch specified issuer (%v): %v", issuer, err)
 		}
@@ -283,7 +328,7 @@ func buildCRLs(ctx context.Context, b *backend, req *logical.Request, forceNew b
 		}
 		issuerIDCertMap[issuer] = thisCert
 
-		subject := string(thisCert.RawIssuer)
+		subject := string(thisCert.RawSubject)
 		if _, ok := keySubjectIssuersMap[thisEntry.KeyID]; !ok {
 			keySubjectIssuersMap[thisEntry.KeyID] = make(map[string][]issuerID)
 		}
@@ -405,9 +450,12 @@ func buildCRLs(ctx context.Context, b *backend, req *logical.Request, forceNew b
 		}
 	}
 
-	// Finally, persist our potentially updated local CRL config
-	if err := setLocalCRLConfig(ctx, req.Storage, crlConfig); err != nil {
-		return fmt.Errorf("error building CRLs: unable to persist updated cluster-local CRL config: %v", err)
+	// Finally, persist our potentially updated local CRL config. Only do this
+	// if we didn't have a legacy CRL bundle.
+	if !wasLegacy {
+		if err := setLocalCRLConfig(ctx, req.Storage, crlConfig); err != nil {
+			return fmt.Errorf("error building CRLs: unable to persist updated cluster-local CRL config: %v", err)
+		}
 	}
 
 	// All good :-)
@@ -462,7 +510,7 @@ func getRevokedCertEntries(ctx context.Context, req *logical.Request, issuerIDCe
 
 		// If we have a CertificateIssuer field on the revocation entry,
 		// prefer it to manually checking each issuer signature, assuming it
-		// appears valid. Its highly unlikely for two different issuers
+		// appears valid. It's highly unlikely for two different issuers
 		// to have the same id (after the first was deleted).
 		if len(revInfo.CertificateIssuer) > 0 {
 			issuerId := revInfo.CertificateIssuer
@@ -548,17 +596,7 @@ func buildCRL(ctx context.Context, b *backend, req *logical.Request, forceNew bo
 	revokedCerts = revoked
 
 WRITE:
-	_, bundle, caErr := fetchCertBundleByIssuerId(ctx, req.Storage, thisIssuerId, true /* need the signing key */)
-	if caErr != nil {
-		switch caErr.(type) {
-		case errutil.UserError:
-			return errutil.UserError{Err: fmt.Sprintf("could not fetch the CA certificate: %s", caErr)}
-		default:
-			return errutil.InternalError{Err: fmt.Sprintf("error fetching CA certificate: %s", caErr)}
-		}
-	}
-
-	signingBundle, caErr := parseCABundle(ctx, b, req, bundle)
+	signingBundle, caErr := fetchCAInfoByIssuerId(ctx, b, req, thisIssuerId, CRLSigningUsage)
 	if caErr != nil {
 		switch caErr.(type) {
 		case errutil.UserError:
@@ -580,8 +618,15 @@ WRITE:
 		return errutil.InternalError{Err: fmt.Sprintf("error creating new CRL: %s", err)}
 	}
 
+	writePath := "crls/" + identifier.String()
+	if thisIssuerId == legacyBundleShimID {
+		// Ignore the CRL ID as it won't be persisted anyways; hard-code the
+		// old legacy path and allow it to be updated.
+		writePath = legacyCRLPath
+	}
+
 	err = req.Storage.Put(ctx, &logical.StorageEntry{
-		Key:   "crls/" + identifier.String(),
+		Key:   writePath,
 		Value: crlBytes,
 	})
 	if err != nil {

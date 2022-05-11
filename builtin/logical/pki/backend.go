@@ -293,8 +293,13 @@ func (b *backend) metricsWrap(callType string, roleMode int, ofunc roleOperation
 
 // initialize is used to perform a possible PKI storage migration if needed
 func (b *backend) initialize(ctx context.Context, _ *logical.InitializationRequest) error {
+	// Grab the lock prior to the updating of the storage lock preventing us flipping
+	// the storage flag midway through the request stream of other requests.
+	b.issuersLock.Lock()
+	defer b.issuersLock.Unlock()
+
 	// Load up our current pki storage state, no matter the host type we are on.
-	b.updatePkiStorageVersion(ctx)
+	b.updatePkiStorageVersion(ctx, false)
 
 	// Early exit if not a primary cluster or performance secondary with a local mount.
 	if b.System().ReplicationState().HasState(consts.ReplicationDRSecondary|consts.ReplicationPerformanceStandby) ||
@@ -303,36 +308,46 @@ func (b *backend) initialize(ctx context.Context, _ *logical.InitializationReque
 		return nil
 	}
 
-	b.issuersLock.Lock()
-	defer b.issuersLock.Unlock()
-
 	if err := migrateStorage(ctx, b, b.storage); err != nil {
 		b.Logger().Error("Error during migration of PKI mount: " + err.Error())
 		return err
 	}
 
-	b.updatePkiStorageVersion(ctx)
+	b.updatePkiStorageVersion(ctx, false)
 
 	return nil
 }
 
 func (b *backend) useLegacyBundleCaStorage() bool {
+	// This helper function is here to choose whether or not we use the newer
+	// issuer/key storage format or the older legacy ca bundle format.
+	//
+	// This happens because we might've upgraded secondary PR clusters to
+	// newer vault code versions. We still want to be able to service requests
+	// with the old bundle format (e.g., issuing and revoking certs), until
+	// the primary cluster's active node is upgraded to the newer Vault version
+	// and the storage is migrated to the new format.
 	version := b.pkiStorageVersion.Load()
 	return version == nil || version == 0
 }
 
-func (b *backend) updatePkiStorageVersion(ctx context.Context) {
+func (b *backend) updatePkiStorageVersion(ctx context.Context, grabIssuersLock bool) {
 	info, err := getMigrationInfo(ctx, b.storage)
 	if err != nil {
 		b.Logger().Error(fmt.Sprintf("Failed loading PKI migration status, staying in legacy mode: %v", err))
 		return
 	}
 
+	if grabIssuersLock {
+		b.issuersLock.Lock()
+		defer b.issuersLock.Unlock()
+	}
+
 	if info.isRequired {
 		b.Logger().Info("PKI migration is required, reading cert bundle from legacy ca location")
 		b.pkiStorageVersion.Store(0)
 	} else {
-		b.Logger().Debug("PKI migration completed, reading cert bundle from key/issuer storage")
+		b.Logger().Debug("PKI migration previously completed, reading cert bundle from key/issuer storage")
 		b.pkiStorageVersion.Store(1)
 	}
 }
@@ -341,9 +356,13 @@ func (b *backend) invalidate(ctx context.Context, key string) {
 	switch {
 	case strings.HasPrefix(key, legacyMigrationBundleLogKey):
 		// This is for a secondary cluster to pick up that the migration has completed
-		// and reset its compatibility mode and rebuild the CRL locally.
-		b.updatePkiStorageVersion(ctx)
-		b.crlBuilder.requestRebuildIfActiveNode(b)
+		// and reset its compatibility mode and rebuild the CRL locally. Kick it off
+		// as a go routine to not block this call due to the lock grabbing
+		// within updatePkiStorageVersion.
+		go func() {
+			b.updatePkiStorageVersion(ctx, true)
+			b.crlBuilder.requestRebuildIfActiveNode(b)
+		}()
 	case strings.HasPrefix(key, issuerPrefix):
 		// If an issuer has changed on the primary, we need to schedule an update of our CRL,
 		// the primary cluster would have done it already, but the CRL is cluster specific so
