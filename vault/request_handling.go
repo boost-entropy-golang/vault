@@ -385,6 +385,10 @@ func (c *Core) checkToken(ctx context.Context, req *logical.Request, unauth bool
 		RootPrivsRequired: rootPath,
 	})
 
+	auth.PolicyResults = &logical.PolicyResults{
+		Allowed: authResults.Allowed,
+	}
+
 	if !authResults.Allowed {
 		retErr := authResults.Error
 
@@ -408,6 +412,13 @@ func (c *Core) checkToken(ctx context.Context, req *logical.Request, unauth bool
 			retErr = multierror.Append(retErr, logical.ErrPermissionDenied)
 		}
 		return auth, te, retErr
+	}
+
+	if authResults.ACLResults != nil && len(authResults.ACLResults.GrantingPolicies) > 0 {
+		auth.PolicyResults.GrantingPolicies = authResults.ACLResults.GrantingPolicies
+	}
+	if authResults.SentinelResults != nil && len(authResults.SentinelResults.GrantingPolicies) > 0 {
+		auth.PolicyResults.GrantingPolicies = append(auth.PolicyResults.GrantingPolicies, authResults.SentinelResults.GrantingPolicies...)
 	}
 
 	// If it is an authenticated ( i.e with vault token ) request, increment client count
@@ -1506,12 +1517,6 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 					}
 				}
 			} else if len(matchedMfaEnforcementList) > 0 && len(req.MFACreds) == 0 {
-				// two-phase login MFA requests should be forwarded
-				// to the active node, as the validation should only
-				// happen in that node
-				if c.perfStandby {
-					return nil, nil, logical.ErrPerfStandbyPleaseForward
-				}
 				mfaRequestID, err := uuid.GenerateUUID()
 				if err != nil {
 					return nil, nil, err
@@ -1541,7 +1546,7 @@ func (c *Core) handleLoginRequest(ctx context.Context, req *logical.Request) (re
 					TimeOfStorage:         time.Now(),
 					RequestID:             mfaRequestID,
 				}
-				err = c.SaveMFAResponseAuth(respAuth)
+				err = possiblyForwardSaveCachedAuthResponse(ctx, c, respAuth)
 				if err != nil {
 					return nil, nil, err
 				}
