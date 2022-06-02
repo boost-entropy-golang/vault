@@ -178,6 +178,13 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 		resp.AddWarning("This issuer certificate was generated without a Subject; this makes it likely that issuing leaf certs with this certificate will cause TLS validation libraries to reject this certificate.")
 	}
 
+	if len(parsedBundle.Certificate.OCSPServer) == 0 && len(parsedBundle.Certificate.IssuingCertificateURL) == 0 && len(parsedBundle.Certificate.CRLDistributionPoints) == 0 {
+		// If the operator hasn't configured any of the URLs prior to
+		// generating this issuer, we should add a warning to the response,
+		// informing them they might want to do so and re-generate the issuer.
+		resp.AddWarning("This mount hasn't configured any authority access information fields; this may make it harder for systems to find missing certificates in the chain or to validate revocation status of certificates. Consider updating /config/urls with this information.")
+	}
+
 	switch format {
 	case "pem":
 		resp.Data["certificate"] = cb.Certificate
@@ -222,7 +229,9 @@ func (b *backend) pathCAGenerateRoot(ctx context.Context, req *logical.Request, 
 		return nil, err
 	}
 	resp.Data["issuer_id"] = myIssuer.ID
+	resp.Data["issuer_name"] = myIssuer.Name
 	resp.Data["key_id"] = myKey.ID
+	resp.Data["key_name"] = myKey.Name
 
 	// Also store it as just the certificate identified by serial number, so it
 	// can be revoked
@@ -281,6 +290,7 @@ func (b *backend) pathIssuerSignIntermediate(ctx context.Context, req *logical.R
 		AllowedSerialNumbers:      []string{"*"},
 		AllowedURISANs:            []string{"*"},
 		NotAfter:                  data.Get("not_after").(string),
+		NotBeforeDuration:         time.Duration(data.Get("not_before_duration").(int)) * time.Second,
 	}
 	*role.AllowWildcardCertificates = true
 
@@ -368,32 +378,37 @@ func (b *backend) pathIssuerSignIntermediate(ctx context.Context, req *logical.R
 		resp.AddWarning("This issuer certificate was generated without a Subject; this makes it likely that issuing leaf certs with this certificate will cause TLS validation libraries to reject this certificate.")
 	}
 
+	if len(parsedBundle.Certificate.OCSPServer) == 0 && len(parsedBundle.Certificate.IssuingCertificateURL) == 0 && len(parsedBundle.Certificate.CRLDistributionPoints) == 0 {
+		// If the operator hasn't configured any of the URLs prior to
+		// generating this issuer, we should add a warning to the response,
+		// informing them they might want to do so and re-generate the issuer.
+		resp.AddWarning("This mount hasn't configured any authority access information fields; this may make it harder for systems to find missing certificates in the chain or to validate revocation status of certificates. Consider updating /config/urls with this information.")
+	}
+
+	caChain := append([]string{cb.Certificate}, cb.CAChain...)
+
 	switch format {
 	case "pem":
 		resp.Data["certificate"] = cb.Certificate
 		resp.Data["issuing_ca"] = signingCB.Certificate
-		if cb.CAChain != nil && len(cb.CAChain) > 0 {
-			resp.Data["ca_chain"] = cb.CAChain
-		}
+		resp.Data["ca_chain"] = caChain
 
 	case "pem_bundle":
 		resp.Data["certificate"] = cb.ToPEMBundle()
 		resp.Data["issuing_ca"] = signingCB.Certificate
-		if cb.CAChain != nil && len(cb.CAChain) > 0 {
-			resp.Data["ca_chain"] = cb.CAChain
-		}
+		resp.Data["ca_chain"] = caChain
 
 	case "der":
 		resp.Data["certificate"] = base64.StdEncoding.EncodeToString(parsedBundle.CertificateBytes)
 		resp.Data["issuing_ca"] = base64.StdEncoding.EncodeToString(signingBundle.CertificateBytes)
 
-		var caChain []string
+		var derCaChain []string
+		derCaChain = append(derCaChain, base64.StdEncoding.EncodeToString(parsedBundle.CertificateBytes))
 		for _, caCert := range parsedBundle.CAChain {
-			caChain = append(caChain, base64.StdEncoding.EncodeToString(caCert.Bytes))
+			derCaChain = append(derCaChain, base64.StdEncoding.EncodeToString(caCert.Bytes))
 		}
-		if caChain != nil && len(caChain) > 0 {
-			resp.Data["ca_chain"] = cb.CAChain
-		}
+		resp.Data["ca_chain"] = derCaChain
+
 	default:
 		return nil, fmt.Errorf("unsupported format argument: %s", format)
 	}

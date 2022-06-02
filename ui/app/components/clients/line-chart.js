@@ -56,8 +56,7 @@ export default class LineChart extends Component {
       );
     }
     const filteredData = dataset.filter((e) => Object.keys(e).includes(this.yKey)); // months with data will contain a 'clients' key (otherwise only a timestamp)
-    const dataMax = max(filteredData.map((d) => d[this.yKey]));
-    const domainMax = Math.ceil(dataMax / 10) * 10; // we want to round UP to the nearest tens place ex. dataMax = 102, domainMax = 110
+    const domainMax = max(filteredData.map((d) => d[this.yKey]));
     const chartSvg = select(element);
     chartSvg.attr('viewBox', `-50 20 600 ${SVG_DIMENSIONS.height}`); // set svg dimensions
 
@@ -83,8 +82,13 @@ export default class LineChart extends Component {
 
     const xAxis = axisBottom(xScale).tickSize(0);
 
-    yAxis(chartSvg.append('g'));
-    xAxis(chartSvg.append('g').attr('transform', `translate(0, ${SVG_DIMENSIONS.height + 10})`));
+    yAxis(chartSvg.append('g').attr('data-test-line-chart', 'y-axis-labels'));
+    xAxis(
+      chartSvg
+        .append('g')
+        .attr('transform', `translate(0, ${SVG_DIMENSIONS.height + 10})`)
+        .attr('data-test-line-chart', 'x-axis-labels')
+    );
 
     chartSvg.selectAll('.domain').remove();
 
@@ -126,7 +130,7 @@ export default class LineChart extends Component {
       .data(filteredData)
       .enter()
       .append('circle')
-      .attr('class', 'data-plot')
+      .attr('data-test-line-chart', 'plot-point')
       .attr('cy', (d) => `${100 - yScale(d[this.yKey])}%`)
       .attr('cx', (d) => xScale(d[this.xKey]))
       .attr('r', 3.5)

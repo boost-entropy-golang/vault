@@ -46,6 +46,22 @@ in a FIPS-compliant manner. We are not a NIST-certified testing laboratory
 and thus organizations may need to consult an approved auditor for final
 information.
 
+The FIPS 140-2 variant of Vault uses separate binaries; these are available
+from the following sources:
+
+ - From the [Hashicorp Releases Page](https://releases.hashicorp.com/vault),
+   ending with the `+ent.fips1402` and `+ent.hsm.fips1402` suffixes.
+ - From the [Docker Hub `hashicorp/vault-enterprise-fips`](https://hub.docker.com/r/hashicorp/vault-enterprise-fips)
+   container repository.
+ - From the [AWS ECR `hashicorp/vault-enterprise-fips`](https://gallery.ecr.aws/hashicorp/vault-enterprise-fips)
+   container repository.
+
+~> **Note**: When pulling the FIPS UBI-based images, note that they are
+   ultimately designed for OpenShift certification; consider either adding
+   the `--user root --cap-add IPC_LOCK` options, to allow Vault to enable
+   mlock, or use the `--env SKIP_SETCAP=1` option, to disable mlock
+   completely, as appropriate for your environment.
+
 ## Technical Details
 
 Vault Enterprise's FIPS 140-2 Inside binaries rely on a special version of the
@@ -157,3 +173,13 @@ The following algorithms were certified as part of this release:
  - HMAC+SHA-2 with 224, 256, 384, and 512-bit variants of SHA-2,
  - TLSv1.0/TLSv1.1 and TLSv1.2 KDFs,
  - AES-256 based CRT_DRBG CS-PRNG.
+
+### Leidos Compliance
+
+See the updated [Leidos Compliance Letter (V Entr v1.10.0+entrfips) for FIPS Inside](https://www.datocms-assets.com/2885/1653327036-boringcrypto_compliance_letter_signed.pdf) using the Boring Crypto Libraries for more details. All [past letters](https://www.hashicorp.com/vault-compliance) are also available for reference.
+
+What is the difference between Seal Wrap FIPS 140 compliance and the new FIPS Inside compliance?
+- Only the storage of sensitive entries (seal wrapped entries) is covered by FIPS-validated crypto when using Seal Wrapping.
+- The TLS connection to Vault by clients is not covered by FIPS-validated crypto when using Seal Wrapping (it is when using FIPS 140-2 Inside, per items 1, 2, 7, and 13 in the updated letter).
+- The generation of key material  wasn't using FIPS-validated crypto in the Seal Wrap version (for example, the PKI certificates: item 8 in the updated FIPS 140-2 Inside letter; or SSH module: item 10 in the updated FIPS 140-2 Inside letter).
+- With Seal Wrapping, some entries were protected with FIPS-validated crypto, but all crypto in Vault wasn't FIPS certified. With FIPS 140-2 Inside, by default (if the algorithm is certified), Vault will be using the certified crypto implementation.
