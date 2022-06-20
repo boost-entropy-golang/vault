@@ -493,6 +493,10 @@ func (c *Core) handleCancelableRequest(ctx context.Context, req *logical.Request
 		return nil, err
 	}
 
+	// MountPoint will not always be set at this point, so we ensure the req contains it
+	// as it is depended on by some functionality (e.g. quotas)
+	req.MountPoint = c.router.MatchingMount(ctx, req.Path)
+
 	// Decrement the wait group when our request is done
 	if waitGroup != nil {
 		defer waitGroup.Done()
@@ -1941,6 +1945,12 @@ func (c *Core) checkSSCTokenInternal(ctx context.Context, token string, isPerfSt
 	if err != nil {
 		return "", err
 	}
+
+	// Disregard SSCT on perf-standbys for non-raft storage
+	if c.perfStandby && c.getRaftBackend() == nil {
+		return plainToken.Random, nil
+	}
+
 	ep := int(plainToken.IndexEpoch)
 	if ep < c.tokenStore.GetSSCTokensGenerationCounter() {
 		return plainToken.Random, nil

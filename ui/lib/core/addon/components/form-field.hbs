@@ -23,16 +23,17 @@
     {{#if (eq @attr.options.editType "radio")}}
       <div class="control columns is-gapless" data-test-radio-input>
         {{#each (path-or-array @attr.options.possibleValues @model) as |val|}}
-          <div class="column is-1 is-flex-center has-text-grey">
+          <div class="column is-1 is-flex-center has-text-grey" data-test-input={{@attr.name}}>
             <RadioButton
               class="radio"
               name={{@attr.name}}
-              id={{dasherize (or val.value val)}}
+              id={{or val.value val}}
+              value={{or val.value val}}
               @value={{or val.value val}}
               @onChange={{this.setAndBroadcast}}
               @groupValue={{(get @model this.valuePath)}}
             />
-            <label for={{dasherize (or val.value val)}} class="has-left-margin-xs">
+            <label for={{or val.value val}} class="has-left-margin-xs">
               {{or val.value val}}
             </label>
           </div>
@@ -126,6 +127,7 @@
     <div class="field">
       {{#let (or (get @model this.valuePath) @attr.options.setDefault) as |initialValue|}}
         <TtlPicker2
+          data-test-input={{@attr.name}}
           @onChange={{this.setAndBroadcastTtl}}
           @label={{this.labelString}}
           @helperTextDisabled={{or @attr.options.helperTextDisabled "Vault will use the default lease duration."}}
@@ -194,12 +196,13 @@
     </Toggle>
   {{else if (eq @attr.options.editType "stringArray")}}
     <StringList
-      @data-test-input={{@attr.name}}
+      data-test-input={{@attr.name}}
       @label={{this.labelString}}
       @warning={{@attr.options.warning}}
       @helpText={{@attr.options.helpText}}
       @inputValue={{get @model this.valuePath}}
       @onChange={{this.setAndBroadcast}}
+      @attrName={{@attr.name}}
     />
   {{else if (eq @attr.options.sensitive true)}}
     {{! Masked Input }}
